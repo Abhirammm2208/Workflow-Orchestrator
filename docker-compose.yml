@@ -1,0 +1,53 @@
+version: "3.9"
+
+services:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL — primary database (checkpoints + run metadata)
+  # Matches PgAdmin credentials provided
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: workflow_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: Abhiram@123
+      POSTGRES_DB: Workflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_extensions.sql:/docker-entrypoint-initdb.d/01_init_extensions.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d Workflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Application — FastAPI + LangGraph orchestrator
+  # Comment this out if running the app locally (uvicorn app.main:app --reload)
+  # ---------------------------------------------------------------------------
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: workflow_app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:Abhiram@123@postgres:5432/Workflow
+      PSYCOPG_URL: postgresql+psycopg://postgres:Abhiram@123@postgres:5432/Workflow
+      CHECKPOINT_DB_URI: postgresql://postgres:Abhiram@123@postgres:5432/Workflow
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./app:/app/app         # hot-reload in dev
+
+volumes:
+  postgres_data:
+    driver: local

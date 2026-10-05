@@ -1,0 +1,64 @@
+# =============================================================================
+# .gitignore — Customer Support Triage Orchestrator
+# =============================================================================
+
+# --- Secrets — NEVER commit these ---
+.env
+*.pem
+*.key
+*.p12
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+.eggs/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+.env.local
+
+# --- Testing ---
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+nosetests.xml
+coverage.xml
+*.cover
+
+# --- IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- Logs ---
+*.log
+logs/
+
+# --- Docker volumes ---
+postgres_data/
+
+# --- OS ---
+desktop.ini
