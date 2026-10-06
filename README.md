@@ -550,7 +550,77 @@ py demo_cli.py
 
 ---
 
-## 12. Evaluation Scenarios
+## 12. Success Metrics
+
+A run is declared **successful** when all of the following conditions are true simultaneously. These are the exact conditions checked by `evaluate.py`.
+
+| Metric | Condition | How Measured |
+|---|---|---|
+| **Run created** | `run_id` (UUID4) returned by `POST /runs` | Response body `run_id` is non-null and parseable as UUID |
+| **Triage completed** | `artifacts.category` ∈ {`"Billing"`, `"Tech"`} | `GET /runs/{id}` → `artifacts.category` |
+| **Urgency assigned** | `artifacts.urgency` ∈ {`"High"`, `"Low"`} | `GET /runs/{id}` → `artifacts.urgency` |
+| **Specialist data retrieved** | `artifacts.billing_info` OR `artifacts.relevant_docs` is non-empty | Presence of correct key in `artifacts` |
+| **Draft reply generated** | `artifacts.draft_reply` is non-empty string, `artifacts.draft_word_count` > 0 | `GET /runs/{id}` → `artifacts.draft_reply` |
+| **Human gate held** | `email_sent` is absent/false AND `send_email` not in `step_log` BEFORE `/approve` | State inspection before calling `/approve` |
+| **Email dispatched** | `artifacts.email_sent == True` AND `artifacts.email_sent_at` is set | After `/approve`, `GET /runs/{id}` |
+| **Step trace complete** | `step_log` has exactly 5 entries: triage → specialist → draft → human_approval → send_email | `len(step_log) == 5` |
+| **All steps timed** | Every `step_log` entry has `started_at`, `ended_at`, `duration_ms` | Each entry checked for all three fields |
+| **Final status** | `status == "completed"` | Top-level `status` field |
+| **No errors** | `errors == []` | `errors` list is empty on a clean run |
+
+### What a Successful Run Looks Like in the CLI
+
+```
+╭─────────────────────── Step 1 — Triage (LLM) ───────────────────────────╮
+│   Category  : Billing                                                   │
+│   Urgency   : High                                                      │
+│   Sentiment : frustrated                                                │
+│   Reasoning : Duplicate charge reported with specific transaction date  │
+╰─────────────────────────────────────────────────────────────────────────╯
+
+╭──────────────────── Step 2a — Billing API Data ─────────────────────────╮
+│   Invoice ID   : INV-10156                                              │
+│   Plan         : Pro Monthly                                            │
+│   Status       : overdue                                                │
+│   Amount Due   : $99.98                                                 │
+│   Suspended    : No                                                     │
+╰─────────────────────────────────────────────────────────────────────────╯
+
+╭──────────────── Step 3 — LLM Draft Reply  (187 words) ──────────────────╮
+│   Dear Customer,                                                        │
+│   We sincerely apologise for the double charge on your account...       │
+╰─────────────────────────────────────────────────────────────────────────╯
+
+  ⏸  Workflow paused — awaiting your approval.
+  [A] Approve → email sent   [R] Reject → email blocked   [C] Cancel
+
+  Your decision: A
+  Reviewer note: Billing data confirmed. Safe to send.
+
+╭──────────────────────── Step Trace ─────────────────────────────────────╮
+│ Step            │ Status    │ Duration  │ Evidence                      │
+│ triage          │ completed │ 1,167 ms  │ category=Billing urgency=High │
+│ billing_lookup  │ completed │    50 ms  │ invoice_id=INV-10156          │
+│ draft_reply     │ completed │ 36,490 ms │ word_count=187                │
+│ human_approval  │ approved  │ 42,000 ms │ reviewed_by=demo_agent        │
+│ send_email      │ completed │     8 ms  │ idempotency_check=passed      │
+╰─────────────────────────────────────────────────────────────────────────╯
+  ✓ status: completed   ✓ email_sent: true
+```
+
+### Failure and Partial-Run Conditions
+
+| Condition | Expected `status` | Recovery path |
+|---|---|---|
+| Step 2 API timeout or injected error | `failed` | `POST /runs/{id}/retry` |
+| LLM returns unparseable JSON during triage | `failed` | `POST /runs/{id}/retry` |
+| Human rejects the draft | `rejected` | No recovery — create a new run |
+| Run cancelled before approval | `cancelled` | No recovery — create a new run |
+| Email already sent (idempotency guard triggered) | `completed` | No action needed — skipped silently |
+
+---
+
+## 13. Evaluation Scenarios
 
 Run all five automatically:
 
@@ -558,25 +628,130 @@ Run all five automatically:
 py evaluate.py
 ```
 
+Each scenario prints a coloured pass/fail for every assertion. A summary table shows total results at the end.
+
+---
+
 ### Scenario 1 — Normal Run
 
-Triggers a Billing ticket. Verifies: triage completes, billing data retrieved, draft generated, run pauses at human_approval (email NOT sent), approve resumes, email sent, `status: completed`, 5 entries in `step_log`.
+**Purpose:** Verify the full happy path works end-to-end.
 
-### Scenario 2 — Inject Failure and Resume
+**Steps:**
+1. `POST /runs` with a Billing ticket
+2. `GET /runs/{id}` — inspect pre-approval state
+3. `POST /runs/{id}/approve`
+4. `GET /runs/{id}` — inspect final state
 
-Triggers with `inject_failure: true`. Step 2 raises `RuntimeError`. Verifies: `status: failed`, error in `errors[]`, checkpoint preserved. Calls `/retry`. Verifies: resumes from Step 2 (triage count = 1, not 2), run completes.
+**Pass criteria (all must be true):**
 
-### Scenario 3 — Idempotency
+| Check | Expected |
+|---|---|
+| `run_id` is UUID4 | ✓ |
+| `status` after trigger | `"paused"` |
+| `artifacts.category` | `"Billing"` |
+| `artifacts.draft_reply` non-empty | ✓ |
+| `email_sent` before approve | `false` / absent |
+| `send_email` in `step_log` before approve | absent |
+| `status` after approve | `"completed"` |
+| `email_sent` after approve | `true` |
+| `email_sent_at` timestamp set | ✓ |
+| `len(step_log)` | `5` |
 
-On the completed run from Scenario 1, inspects `step_log` for `send_email`. Verifies `email_sent=True` is persisted. Demonstrates that a second call to send_email would return `status: skipped` with evidence `"email_sent=True — idempotency guard triggered"`.
+---
 
-### Scenario 4 — Human Approval Gate
+### Scenario 2 — Inject Failure + Resume from Checkpoint
 
-Triggers a Tech ticket. Immediately calls `GET /runs/{id}`. Verifies: `email_sent` absent, `send_email` not in `step_log`, `human_approval` is `pending`. Calls `/approve`. Verifies: `status: completed`, `email_sent: true`, `send_email` now in `step_log`. Also tests `/approve` on a cancelled run → `409 Conflict`.
+**Purpose:** Prove checkpoints are saved correctly and retry resumes at the right node, not from the beginning.
 
-### Scenario 5 — Cancellation
+**Steps:**
+1. `POST /runs` with `inject_failure: true`
+2. `GET /runs/{id}` — confirm failed state
+3. `POST /runs/{id}/retry` with `clear_failure: true`
+4. (Approve if paused) → `GET /runs/{id}` — confirm completion
 
-Triggers a run, immediately calls `/cancel`. Verifies: `status: cancelled`, `email_sent` absent, subsequent `/approve` returns error.
+**Pass criteria:**
+
+| Check | Expected |
+|---|---|
+| `status` after injected failure | `"failed"` |
+| `errors[]` non-empty | ✓ |
+| Failed step in `errors[0].step` | `"billing_lookup"` or `"doc_search"` |
+| `email_sent` during failed run | `false` |
+| After retry: `status` | `"completed"` |
+| Count of `"triage"` entries in `step_log` | `1` (not replayed) |
+| `email_sent` after retry+approve | `true` |
+
+---
+
+### Scenario 3 — Idempotency Proof
+
+**Purpose:** Prove `send_email_node` does not dispatch a second email if called again on a completed run.
+
+**Steps:**
+1. Use the completed run from Scenario 1
+2. Inspect `step_log` and `artifacts`
+3. Verify the state-flag guard fields
+
+**Pass criteria:**
+
+| Check | Expected |
+|---|---|
+| `artifacts.email_sent` | `true` |
+| `artifacts.email_sent_at` | non-null ISO timestamp |
+| `send_email` step in `step_log` has `status` | `"completed"` with `idempotency_check: "passed — email not previously sent"` |
+| If `send_email_node` called a second time | Would return `status: "skipped"` and evidence `"email_sent=True — idempotency guard triggered"` |
+
+> The guard is in `app/graph/nodes.py` at the top of `send_email_node`: `if artifacts.get("email_sent") is True: return skipped entry`.
+
+---
+
+### Scenario 4 — Human Approval Gate (Downstream Blocked)
+
+**Purpose:** Prove Step 5 (`send_email`) is completely unreachable until `/approve` is explicitly called.
+
+**Steps:**
+1. `POST /runs` with a Tech ticket
+2. Immediately `GET /runs/{id}` — before calling `/approve`
+3. Assert `send_email` is absent
+4. `POST /runs/{id}/approve`
+5. `GET /runs/{id}` — assert `send_email` now present and completed
+6. `POST /runs/{id}/cancel` on a different paused run
+7. `POST /runs/{id}/approve` on that cancelled run — expect `409`
+
+**Pass criteria:**
+
+| Check | Expected |
+|---|---|
+| `status` before approve | `"paused"` |
+| `email_sent` before approve | `false` / absent |
+| `"send_email"` in `step_log` before approve | absent (0 entries) |
+| `human_approval.status` in `step_log` before approve | `"pending"` |
+| `status` after approve | `"completed"` |
+| `email_sent` after approve | `true` |
+| `"send_email"` in `step_log` after approve | present, `status: "completed"` |
+| `/approve` on cancelled run | `409 Conflict` |
+
+---
+
+### Scenario 5 — Cancellation and Safe Terminal State
+
+**Purpose:** Prove cancellation is immediate, terminal, and blocks all further actions.
+
+**Steps:**
+1. `POST /runs` — get `run_id`
+2. `POST /runs/{id}/cancel`
+3. `GET /runs/{id}` — confirm cancelled state
+4. `POST /runs/{id}/approve` — expect `409`
+
+**Pass criteria:**
+
+| Check | Expected |
+|---|---|
+| `status` after cancel | `"cancelled"` |
+| `email_sent` after cancel | `false` / absent |
+| `cancelled_at` timestamp | non-null |
+| `/approve` after cancel | `409 Conflict` |
+| No `send_email` in `step_log` | ✓ |
 
 ---
 
