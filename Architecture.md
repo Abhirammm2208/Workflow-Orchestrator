@@ -2,9 +2,9 @@
 
 ## Design Philosophy
 
-The system is built around three principles:
+The system is built around three principles :
 
-1. **State is the source of truth.** Every piece of information — inputs, outputs, errors, decisions — lives in `AgentState`. No side-channel variables, no global state.
+1. **State is the source of truth.** Every piece of information  — inputs, outputs, errors, decisions — lives in `AgentState`. No side-channel variables, no global state.
 2. **The graph is append-only.** Nodes only add to `step_log` and `artifacts`. They never delete or overwrite existing data. This makes every run fully auditable.
 3. **Persistence is structural, not bolted on.** PostgreSQL checkpoints are wired into the graph at construction time via `AsyncPostgresSaver`. The application code never manually saves state.
 
@@ -340,9 +340,9 @@ LangChain's `ChatOpenAI` silently drops `reasoning_content` from the stream delt
 
 ---
 
-### 2. Persistence Layer — PostgreSQL + SQLAlchemy
+### 2. Persistence Layer — PostgreSQL+SQLAlchemy
 
-#### Two distinct storage concerns
+#### Two distinct storage concernsn
 
 | Store | Technology | Purpose |
 |---|---|---|
