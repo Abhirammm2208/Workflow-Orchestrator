@@ -1,6 +1,6 @@
 # AGENT_WORKFLOW.md
 
-This document describes the architectural decisions made in building this project, how AI coding tools were used as an accelerator, where they required correction, and how a teammate or reviewer should audit the work.
+This document describes the architectural decisions made in building this project, how AI coding tools were used as an accelerator, where they required correction, and how a teammate or reviewer should audit the work . 
 
 ---
 
