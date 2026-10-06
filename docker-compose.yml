@@ -75,6 +75,8 @@ services:
       PSYCOPG_URL: "postgresql+psycopg://postgres:Abhiram%40123@postgres:5432/Workflow"
       CHECKPOINT_DB_URI: "postgresql://postgres:Abhiram%40123@postgres:5432/Workflow"
       APP_ENV: "development"
+      # Use deterministic mock LLM responses — no Nvidia API key required
+      USE_MOCK_LLM: "true"
     ports:
       - "8000:8000"
     volumes:
@@ -112,6 +114,7 @@ services:
       DATABASE_URL: "postgresql+asyncpg://postgres:Abhiram%40123@postgres:5432/Workflow"
       PSYCOPG_URL: "postgresql+psycopg://postgres:Abhiram%40123@postgres:5432/Workflow"
       CHECKPOINT_DB_URI: "postgresql://postgres:Abhiram%40123@postgres:5432/Workflow"
+      USE_MOCK_LLM: "true"
     command: >
       sh -c "
         echo '>>> Initialising database tables...' &&
