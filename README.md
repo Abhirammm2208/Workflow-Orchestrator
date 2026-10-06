@@ -850,7 +850,7 @@ A run is declared **successful** when all of the following conditions are true s
 
 ---
 
-## 13. Evaluation Scenarios
+## 13. Evaluation Scenarios ( TEST CASES )
 
 Run all five automatically:
 
