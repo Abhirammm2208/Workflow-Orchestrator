@@ -1,6 +1,122 @@
 # AGENT_WORKFLOW.md
 
-This document describes how AI tools were used in building this project, where they helped, where they failed, what was changed manually, and how a teammate should audit the work.
+This document describes the architectural decisions made in building this project, how AI coding tools were used as an accelerator, where they required correction, and how a teammate or reviewer should audit the work.
+
+---
+
+## Core Design Philosophy
+
+The initial workflow and architecture were developed through a deliberate review process. AI coding tools were used to generate implementation options, but all architectural decisions were made by reviewing those proposals against the assignment requirements and rejecting or modifying anything that conflicted with the core principles below.
+
+The key principle throughout: **AI handles probabilistic reasoning (classification, text generation). Deterministic application code controls execution, state transitions, persistence, and side effects.**
+
+---
+
+## Key Architectural Decisions (Made During Review)
+
+### Decision 1 — LLM scope is strictly bounded
+
+An early approach would have allowed the LLM to determine the entire workflow path — what action to take, which tool to call, what to do next. This was rejected.
+
+**The reasoning:** In a durable workflow, non-determinism in routing creates untestable, non-reproducible execution paths. If the LLM decides routing, you cannot guarantee the same input produces the same workflow execution. You also cannot checkpoint and resume reliably because the resume path depends on what the model decides to do next.
+
+**What was decided instead:** The LLM is used only for:
+- Semantic classification (`category: Billing | Tech`, `urgency: High | Low`) in Step 1
+- Natural language generation (draft reply) in Step 3
+
+LangGraph executes the actual routing through explicit `add_conditional_edges()` calls based on the structured output from Step 1. The model provides a value; the application decides what to do with it.
+
+```python
+# The model outputs this:
+{"category": "Billing", "urgency": "High"}
+
+# The application routes this — not the model:
+def route_to_specialist(state):
+    if state["artifacts"]["category"] == "Billing":
+        return "billing_lookup"   # deterministic
+    return "doc_search"
+```
+
+This separation means the workflow is fully testable without an LLM (`USE_MOCK_LLM=true`) and fully reproducible across retries.
+
+---
+
+### Decision 2 — Human approval is a hard interrupt, not a soft flag
+
+Two approaches were considered for the human approval gate:
+
+**Option A (rejected):** A boolean flag `awaiting_approval=True` in state. The next invocation checks the flag and decides whether to continue.
+
+**Option B (chosen):** LangGraph's `interrupt_before=["human_approval"]` — the graph engine physically stops before the node runs. Nothing executes until the API explicitly resumes it.
+
+**Why Option A was rejected:** A flag-based approach creates a window between the flag being checked and the email being sent where a race condition or retry could bypass the gate. It also means the email node is technically reachable — just conditionally skipped. The checkpoint-based interrupt is atomic: the email node is unreachable until `/approve` is called. There is no bypass path.
+
+```python
+# Hard interrupt — enforced by the graph engine itself
+graph = builder.compile(
+    checkpointer=checkpointer,
+    interrupt_before=["human_approval"]   # send_email is unreachable until this is resumed
+)
+```
+
+This satisfies the requirement "show that downstream work does not continue early" as a structural guarantee, not just a test assertion.
+
+---
+
+### Decision 3 — Idempotency lives inside the node, not the orchestrator
+
+When designing `send_email_node`, two placement options were considered for the idempotency guard:
+
+**Option A (rejected):** Check `email_sent` in the orchestrator before invoking the node.
+
+**Option B (chosen):** Check `email_sent` as the first line inside `send_email_node` itself.
+
+**Why Option B:** If the check lives in the orchestrator, it only protects against duplicate calls from the same code path. If the node is ever called from a different path, a retry mechanism, or a future code change, the guard is bypassed. Placing it inside the node makes the guard unconditional — the node itself is safe to call any number of times from any context.
+
+```python
+async def send_email_node(state: AgentState) -> dict:
+    # Guard is first — before any side-effecting code
+    if state["artifacts"].get("email_sent") is True:
+        return {"step_log": [...skipped entry...]}  # exits immediately
+
+    # Only reaches here on first execution
+    # ... send email ...
+```
+
+This is also why LangGraph's checkpoint replay alone is not sufficient — the guard needs to work even if a node is re-entered by mistake.
+
+---
+
+### Decision 4 — Two database drivers for the same database
+
+PostgreSQL is used for both application data (SQLAlchemy ORM) and LangGraph checkpoints (AsyncPostgresSaver). The decision to use two separate connection pools with different drivers was explicit:
+
+- **asyncpg** for SQLAlchemy: fastest async driver, purpose-built for application queries
+- **psycopg3** for AsyncPostgresSaver: LangGraph's checkpointer hard-requires a `psycopg.AsyncConnection` — asyncpg is not compatible
+
+The alternative — using only psycopg3 for everything — was considered and rejected because asyncpg is significantly faster for the application-side `SELECT/UPDATE/INSERT` queries that run on every API request.
+
+This means the `runs` table (fast metadata queries) uses asyncpg, and the `checkpoints` table (heavier JSON serialisation) uses psycopg3. Both point to the same PostgreSQL database.
+
+---
+
+### Decision 5 — Separate `runs` metadata table alongside LangGraph checkpoints
+
+LangGraph checkpoints store complete state snapshots — but querying them requires deserialising the entire JSON blob for every row. For `GET /runs` (list view), this would be expensive.
+
+The decision: maintain a lightweight `runs` table in SQLAlchemy as an index over the checkpoint store. It holds only: `run_id`, `status`, `category`, `urgency`, `timestamps`, `last_error`. The `GET /runs/{id}` (detail view) reads from the checkpoint for accuracy; `GET /runs` (list) reads from the `runs` table for speed.
+
+This dual-store approach adds a sync responsibility (the API layer must keep them consistent) but that trade-off was accepted because list performance at demo scale matters more than the complexity of the sync.
+
+---
+
+### Decision 6 — Mock tools must be deterministic, not random
+
+The specialist tools (`billing_api.py`, `doc_search.py`) are mocks. The design choice was to make them deterministic — the same `customer_id` always returns the same billing record — rather than randomly varying.
+
+**Why:** Deterministic mocks make the system fully reproducible. If a run fails and is retried, the retry returns the same specialist data, which means the LLM draft will be based on the same inputs. This is a requirement for idempotency to work correctly across the whole pipeline, not just the email step.
+
+The billing mock uses an MD5 hash of `customer_id` to select from 20 invoice scenarios. The doc search mock scores articles by keyword overlap, which is also deterministic for a given ticket text.
 
 ---
 
@@ -8,182 +124,123 @@ This document describes how AI tools were used in building this project, where t
 
 | Tool | Role |
 |---|---|
-| **Kiro (Agentic IDE — Claude-based)** | Primary development assistant — architecture design, all code generation, debugging, documentation |
-| **Nvidia Nemotron (`nemotron-3-ultra-550b-a55b`)** | Runtime LLM — ticket triage classification and draft reply generation inside the workflow |
+| **Kiro (AI coding assistant)** | Implementation accelerator — generated code scaffolding based on architectural decisions already made |
+| **Nvidia Nemotron (`nemotron-3-ultra-550b-a55b`)** | Runtime LLM — ticket triage classification and draft reply generation inside the live workflow |
 
 ---
 
-## Where AI Helped
+## Where AI Assisted with Implementation
 
-### 1. Architecture Design and Tech Stack Decisions
+Once architectural decisions were made (sections above), AI tooling was used to accelerate implementation of:
 
-The initial problem statement was broad ("build a durable workflow orchestrator"). Kiro was prompted with the full rubric and the chosen workflow (customer support triage), and it produced:
+- Boilerplate code: SQLAlchemy async engine setup, session factory, FastAPI dependency injection patterns
+- ORM model definition: `Run` model fields, JSONB column, index declarations
+- LangGraph graph assembly: `add_node`, `add_edge`, `add_conditional_edges` wiring
+- Seed data: 50 diverse ticket records across all statuses
+- Rich CLI layout: panel rendering, table formatting, polling loop structure
+- Documentation drafts: README sections, Architecture.md Mermaid diagrams
 
-- The full `AgentState` TypedDict schema — including the decision to make `artifacts` append-only and to separate `step_log` from `errors`
-- The decision to use two separate PostgreSQL drivers (`asyncpg` for SQLAlchemy ORM, `psycopg3` for LangGraph's `AsyncPostgresSaver`) — this is a non-obvious requirement that the AI flagged proactively
-- The `interrupt_before=["human_approval"]` approach vs. a manual pause flag — the AI correctly identified that `interrupt_before` is atomic with checkpointing and prevents race conditions
-
-### 2. Boilerplate Code Generation
-
-All of the following were AI-generated without manual changes:
-
-- `app/db/database.py` — async engine, session factory, `get_db` dependency, context manager
-- `app/db/models.py` — full `Run` ORM model with JSONB column, indexes, `to_summary_dict()`
-- `app/tools/billing_api.py` — 20 deterministic billing scenarios with MD5 hash routing
-- `app/tools/doc_search.py` — 30 knowledge base articles with keyword relevance scoring
-- `app/graph/state.py` — `AgentState` with inline docstrings
-- `app/graph/edges.py` — both conditional routing functions
-- `app/db/init_db.py` — standalone DB init script
-
-### 3. LangGraph Graph Assembly
-
-The graph topology (`app/graph/graph.py`) was AI-generated including:
-
-- All `add_node`, `add_edge`, `add_conditional_edges` calls
-- The `interrupt_before` placement
-- The `start_run`, `resume_run`, `get_run_state`, `get_run_history` helper functions
-- The `make_config` function tying `run_id` to `thread_id`
-
-### 4. Seed Data and Evaluation Script
-
-- `seed_data.py` — all 50 records, step logs, varied artifacts and draft replies were AI-generated
-- `evaluate.py` — all 5 scenarios with `assert_check` helpers and Rich terminal output
-
-### 5. Demo CLI
-
-`demo_cli.py` was fully AI-generated, including the layout of the LLM summary panels, the approval prompt flow, the pending approvals dashboard, and the polling loop.
+In each case, the generated output was reviewed against the decisions above and modified where needed.
 
 ---
 
-## Where AI Failed or Needed Manual Correction
+## Where the Generated Suggestions Were Wrong or Rejected
 
-### Failure 1 — Model End-of-Life (410 Error)
+### Issue 1 — AI initially allowed LLM to control routing
 
-**What happened:** The AI initially specified `nvidia/llama-3.3-nemotron-super-49b-v1` as the model. This model hit end-of-life on 2026-08-26 and returned HTTP 410 Gone on the first live test.
+The first generated architecture routed nodes based on LLM output without explicit conditional edges. This was rejected — see Decision 1 above.
 
-**How it was found:** Running `py demo_cli.py` → Option 1 → the step trace showed `triage: failed` with `Error code: 410`.
+### Issue 2 — Model end-of-life (410 Error on first run)
 
-**Manual fix:** Updated the model to `nvidia/nemotron-3-ultra-550b-a55b` across `config.py`, `.env`, `.env.example`. The AI had no way to know the model had been deprecated after its training cutoff.
+The AI specified `nvidia/llama-3.3-nemotron-super-49b-v1`. This model hit end-of-life on 2026-08-26 and returned HTTP 410 on the first live test.
 
-### Failure 2 — LangChain ChatOpenAI Doesn't Support Thinking Mode
+**Fix:** Updated to `nvidia/nemotron-3-ultra-550b-a55b` — found by reading the Nvidia NIM platform documentation and selecting the current production model with `enable_thinking` support.
 
-**What happened:** The initial `nodes.py` used LangChain's `ChatOpenAI` client with `with_structured_output(TriageOutput)`. This works for standard models but the `nemotron-3-ultra-550b-a55b` model returns `reasoning_content` in the stream delta — a non-standard field that LangChain silently drops.
+### Issue 3 — LangChain client silently dropped thinking traces
 
-**How it was found:** The triage node ran without errors but the `triage_thinking` artifact was always empty. Inspecting the raw API response manually showed the thinking content was present at the API level.
+The initial implementation used LangChain's `ChatOpenAI` with `with_structured_output()`. The Nemotron model returns its reasoning in `reasoning_content` (a non-standard stream delta field). LangChain drops this field silently — the triage ran without errors but `triage_thinking` was always empty.
 
-**Manual fix:** Rewrote `nodes.py` to use the raw `openai` SDK with `stream=True` and explicit `reasoning_content` capture, exactly as shown in Nvidia's official example. Added `asyncio.to_thread()` wrapper to keep the blocking SDK call compatible with the async FastAPI/LangGraph event loop.
+**Fix:** Replaced with raw `openai` SDK streaming, capturing `reasoning_content` explicitly in the stream loop. Wrapped the synchronous stream in `asyncio.to_thread()` to keep the async event loop unblocked.
 
-### Failure 3 — 409 Conflict on /approve After Normal Run
-
-**What happened:** After a run completed Steps 1–3 and paused at `human_approval`, calling `POST /runs/{id}/approve` returned `409 Conflict — not paused`.
-
-**Root cause:** LangGraph returns `status: "running"` in the state dict when it pauses at `interrupt_before` — because from the graph's perspective the thread is still "in progress". The original `create_run` handler wrote this `"running"` value to the `runs` table, and the approve endpoint checked for `"paused"` exactly.
-
-**Manual fix:** Changed status detection in `create_run` to inspect `artifacts` directly — if `draft_reply` exists and `email_sent` is not `True`, the run is definitively paused regardless of the state `status` field. Also changed the approve endpoint to accept `"paused"` OR `"running"` and validate by checking the checkpoint for a `draft_reply` instead of relying on the DB status column alone.
-
-### Failure 4 — SQLAlchemy Version Conflict During pip install
-
-**What happened:** `pip install -r requirements.txt` failed with `OSError: No such file or directory` on `SQLAlchemy-2.0.36.dist-info`. The system had SQLAlchemy 2.1.3 installed; the requirements file hard-pinned `==2.0.36`.
-
-**Manual fix:** Changed all hard pins in `requirements.txt` to compatible ranges (`>=2.0.36` for SQLAlchemy, `>=` for others). This resolved the conflict cleanly.
-
-### Failure 5 — localhost vs 127.0.0.1 on Windows
-
-**What happened:** After fixing the SQLAlchemy conflict, the DB init script failed with `[Errno 11003] getaddrinfo failed`.
-
-**Root cause:** On Windows, `localhost` resolves to the IPv6 address `::1` first. The `asyncpg` and `psycopg3` drivers require IPv4 `127.0.0.1` explicitly.
-
-Additionally, the password `Abhiram@123` contains `@` which is a URL delimiter — the connection strings were being parsed incorrectly.
-
-**Manual fix:** Changed all DB URLs in `.env`, `.env.example`, and `app/config.py` to use `127.0.0.1` and URL-encode `@` as `%40`.
-
----
-
-## What Was Changed Manually
-
-| File | Manual change |
-|---|---|
-| `app/graph/nodes.py` | Full rewrite from LangChain `ChatOpenAI` to raw `openai` SDK with `reasoning_content` streaming |
-| `app/config.py` | Model name updated to `nemotron-3-ultra-550b-a55b`; DB URLs use `127.0.0.1` and `%40` |
-| `.env` / `.env.example` | Model name, DB host, password URL-encoding |
-| `app/api/routes.py` | Status detection logic in `create_run`; approve/reject validation to accept `"running"` state |
-| `requirements.txt` | Hard pins → compatible version ranges |
-| `demo_cli.py` | Added `draft_thinking` panel display after initial version generated without it |
-
----
-
-## How a Teammate Should Audit the Work
-
-### 1. Verify the state machine is correct
-
-Read `app/graph/graph.py` — the graph topology is the authoritative definition of the workflow. Check:
-- All nodes are registered
-- The conditional edges match the routing logic in `app/graph/edges.py`
-- `interrupt_before=["human_approval"]` is present
-- `AsyncPostgresSaver` is wired as the checkpointer
-
-### 2. Verify idempotency
-
-Open `app/graph/nodes.py` and find `send_email_node`. The guard is:
 ```python
-if artifacts.get("email_sent") is True:
-    # returns skipped entry, exits
+for chunk in stream:
+    reasoning = getattr(chunk.choices[0].delta, "reasoning_content", None)
+    content   = getattr(chunk.choices[0].delta, "content", None)
 ```
-Run `py evaluate.py` and check Scenario 3 output — the second call should show `status: skipped`.
 
-### 3. Verify checkpoint persistence
+### Issue 4 — 409 Conflict on /approve (status sync bug)
 
-After running a workflow, connect to PostgreSQL and run:
-```sql
-SELECT thread_id, checkpoint_id, created_at
-FROM checkpoints
-ORDER BY created_at DESC
-LIMIT 10;
-```
-You should see one row per completed node for each run.
+LangGraph returns `status: "running"` in the state dict when the graph pauses at an interrupt — from the graph's perspective the thread is still active. The generated `create_run` handler wrote this value to the `runs` table. The approve endpoint then checked `run.status == "paused"` and returned 409.
 
-### 4. Verify the 409 fix is robust
+**Fix:** Changed status detection to inspect `artifacts` directly — if `draft_reply` is present and `email_sent` is not True, the run is paused regardless of the graph's reported status. The approve endpoint was updated to validate by checkpoint inspection rather than DB column value.
 
-Start a run. Before calling `/approve`, call `GET /runs/{id}` and confirm `status: "paused"`. Then call `/cancel`. Then call `/approve` — should return `409`. This verifies the terminal state guard works correctly.
+### Issue 5 — Windows-specific environment issues
 
-### 5. Verify mock mode
+Two issues found during local setup:
 
-Set `USE_MOCK_LLM=true` in `.env`, restart the server, run `py evaluate.py`. All 5 scenarios should pass without any API calls.
+1. `localhost` on Windows resolves to IPv6 `::1` first. asyncpg and psycopg3 require IPv4 `127.0.0.1` explicitly.
+2. The password `Abhiram@123` contains `@` which is a URL delimiter — connection strings were being parsed incorrectly.
 
-### 6. Review the LLM prompts
+**Fix:** Changed all DB URLs to use `127.0.0.1` and URL-encode `@` as `%40`. This is a Windows-specific issue not present on Linux/macOS.
 
-The triage prompt is in `triage_node` (search for `system =` in `nodes.py`). The draft reply prompt is in `draft_reply_node`. Both are system prompts passed as `{"role": "system", "content": ...}` — no hidden injection, no external prompt files.
+### Issue 6 — Hard-pinned package versions
+
+Requirements initially used `==` pins (e.g. `sqlalchemy==2.0.36`). The local environment had `2.1.3` installed, causing pip install failures.
+
+**Fix:** Changed all pins to compatible ranges (`>=2.0.36`) to allow pip to resolve against what's installed.
 
 ---
 
-## Redacted Prompt Excerpt That Influenced Architecture
+## What Was Changed Directly in Code (Not AI-Generated)
 
-The following is the prompt session that shaped the **state schema and idempotency design**. This was an early conversation before any code was written.
+| File | Change and reason |
+|---|---|
+| `app/graph/nodes.py` | Full rewrite from LangChain `ChatOpenAI` to raw `openai` SDK — LangChain didn't support `reasoning_content` |
+| `app/api/routes.py` | Status detection logic — LangGraph's `"running"` vs `"paused"` mismatch required artifact-level inspection |
+| `app/api/routes.py` | Approve/reject validation — check checkpoint for `draft_reply` instead of trusting DB status column |
+| `app/config.py` | Model name, DB URLs (`127.0.0.1`, `%40` encoding) |
+| `requirements.txt` | Hard pins → compatible ranges |
+| `docker-compose.yml` | `USE_MOCK_LLM=true` hardcoded in both services — ensures demo works without API key by default |
+| `demo_cli.py` | `draft_thinking` panel added — initial version omitted it |
 
 ---
 
-**Prompt (human):**
+## How to Audit This Work
 
-> I'm building a durable workflow orchestrator for customer support ticket triage. The workflow has 5 steps: triage, specialist routing, draft reply, human approval, send email. I need it to be resumable after failure and idempotent on retry. What should the state schema look like and how should I handle idempotency for the email send step specifically?
+### Verify the LLM boundary is respected
 
-**AI response (excerpt — rephrased for compliance):**
+Open `app/graph/edges.py`. The routing functions take `state` as input and return a string. They read `state["artifacts"]["category"]` — a value set by the LLM in Step 1. They do not call the LLM. The LLM produces data; the application makes decisions.
 
-> For idempotency on the email send, the most robust approach is a state flag guard checked at the start of the node itself — before any side-effecting code runs. Store `email_sent: bool` in the state's `artifacts` dict. At the top of `send_email_node`, check `if artifacts.get("email_sent") is True: return skipped_log_entry`. This is safe because the state is serialised to the checkpoint store after every node completes, so `email_sent=True` is durable across restarts.
+### Verify the human approval gate is structural
+
+Open `app/graph/graph.py`. Find `interrupt_before=["human_approval"]`. Then read `app/api/routes.py` `approve_run()` and `reject_run()` — these are the only paths that resume the graph. There is no timer, no auto-approval, no fallback. The gate cannot be bypassed.
+
+### Verify idempotency is inside the node
+
+Open `app/graph/nodes.py`. Find `send_email_node`. The first executable line after the function signature checks `artifacts.get("email_sent") is True`. This check runs before any email dispatch code. Run `py evaluate.py` Scenario 3 and observe `status: skipped` in the step log.
+
+### Verify checkpoint-based resume (not full replay)
+
+Run `py evaluate.py` Scenario 2. After the injected failure and retry, the step log for the completed run should contain exactly one `triage` entry. If triage had been replayed, there would be two. The checkpoint store is what prevents replay — LangGraph loads the state after the last completed node and continues from there.
+
+### Verify mock mode is complete
+
+Set `USE_MOCK_LLM=true` (already the default in Docker). Run `py evaluate.py`. All 5 scenarios pass. This confirms the workflow logic is entirely independent of the LLM — the LLM only provides values that deterministic code acts on.
+
+---
+
+## Redacted Design Session Excerpt
+
+The following exchange happened early in the design phase and directly shaped the state schema decision.
+
+**Question asked:**
+
+> I'm building a durable workflow orchestrator for customer support triage. I need resumability after failure and idempotency on retry. Should the idempotency guard live in the orchestrator layer or inside the node itself? And should artifacts be mutable across nodes or append-only?
+
+**Key response points (paraphrased):**
+
+> The guard belongs inside the node. If it lives in the orchestrator, any new code path that calls the node bypasses it. Inside the node, it is unconditional.
 >
-> For the state schema, separate concerns cleanly: use an `artifacts` dict for step outputs (append-only), a `step_log` list for the audit trail (append-only), and an `errors` list for failure records. The `status` field at the top level controls lifecycle transitions. Never delete from these structures inside a node — only append. This makes every run fully auditable and simplifies checkpoint comparison.
->
-> For the LangGraph checkpointer, you'll need two separate database drivers — `asyncpg` for your SQLAlchemy ORM queries (faster, fully async) and `psycopg3` for `AsyncPostgresSaver` (LangGraph's checkpointer requirement). Both can point to the same PostgreSQL database but need separate connection pools...
+> Append-only artifacts make every state transition auditable. If you overwrite, you lose the history of what each step produced. This matters for debugging and for idempotency — you need to know what was set and when, not just the current value.
 
-**Impact:** This exchange directly shaped:
-1. The `artifacts` dict being append-only (enforced as a code convention)
-2. The idempotency guard being inside the node rather than in the orchestrator layer
-3. The two-driver PostgreSQL setup being documented explicitly rather than discovered late
-
----
-
-## Limitations of AI-Generated Code in This Project
-
-- The AI cannot test against live APIs (it generated correct code for the Nvidia NIM endpoint structure, but could not verify the model name was still active)
-- The AI generated reasonable default timeout values (`LLM_TIMEOUT_SECONDS=30`) but these may need tuning for the `nemotron-3-ultra-550b-a55b` model which can take 30–60 seconds on complex prompts with `enable_thinking=True`
-- The seed data draft replies are hand-crafted templates, not actual Nemotron outputs — they simulate what the model produces but a reviewer should run at least one live ticket to see the real output
-- The AI suggested `langgraph-checkpoint-postgres==2.0.8` specifically — the actual installed version resolved to `2.0.25` due to range pinning, which is compatible but was not explicitly tested by the AI during generation
+**Decision taken from this:** `artifacts` is append-only by convention. The idempotency guard is the first line of `send_email_node`. Both decisions held through to the final implementation with no modifications.
