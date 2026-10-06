@@ -14,15 +14,18 @@ A production-grade, durable and resumable multi-step agent workflow orchestrator
 6. [Tech Stack and Trade-offs](#6-tech-stack-and-trade-offs)
 7. [Setup and Installation](#7-setup-and-installation)
 8. [Running the Project](#8-running-the-project)
+   - [Option A — Docker (Recommended)](#option-a--docker-recommended-zero-setup)
+   - [Option B — Local Python](#option-b--local-python-no-docker)
 9. [Mock / No-API-Key Mode](#9-mock--no-api-key-mode)
 10. [API Reference](#10-api-reference)
 11. [Demo CLI](#11-demo-cli)
-12. [Evaluation Scenarios](#12-evaluation-scenarios)
-13. [Sample Inputs and Outputs](#13-sample-inputs-and-outputs)
-14. [Assumptions](#14-assumptions)
-15. [Trade-offs and Limitations](#15-trade-offs-and-limitations)
-16. [Next Steps](#16-next-steps)
-17. [Docker](#17-docker)
+12. [Success Metrics](#12-success-metrics)
+13. [Evaluation Scenarios](#13-evaluation-scenarios)
+14. [Sample Inputs and Outputs](#14-sample-inputs-and-outputs)
+15. [Assumptions](#15-assumptions)
+16. [Trade-offs and Limitations](#16-trade-offs-and-limitations)
+17. [Next Steps](#17-next-steps)
+18. [Docker](#18-docker)
 
 ---
 
@@ -210,122 +213,349 @@ class AgentState(TypedDict):
 
 ### Prerequisites
 
-- Python 3.11 or 3.12
-- PostgreSQL 14+ running locally (or Docker)
+- **Docker Desktop** (recommended — zero local setup) **OR** Python 3.11/3.12 + PostgreSQL 14+
 - Git
 
-### Step 1 — Clone the repository
+### Clone the repository
 
 ```bash
 git clone https://github.com/Abhirammm2208/Workflow-Orchestrator.git
 cd Workflow-Orchestrator
 ```
 
-### Step 2 — Install dependencies
-
-```bash
-py -m pip install -r requirements.txt
-```
-
-> On Windows use `py` instead of `python`. On macOS/Linux use `python3`.
-
-### Step 3 — Configure environment
-
-```bash
-copy .env.example .env      # Windows
-cp .env.example .env        # macOS/Linux
-```
-
-Open `.env` and fill in two values:
-
-```env
-# Your Nvidia NIM API key from https://build.nvidia.com/
-# Leave as-is and set USE_MOCK_LLM=true to run without a key
-NVIDIA_API_KEY=nvapi-your-key-here
-
-# If your PostgreSQL password contains special characters like @
-# URL-encode them: @ → %40
-DATABASE_URL=postgresql+asyncpg://postgres:your_password@127.0.0.1:5432/Workflow
-PSYCOPG_URL=postgresql+psycopg://postgres:your_password@127.0.0.1:5432/Workflow
-CHECKPOINT_DB_URI=postgresql://postgres:your_password@127.0.0.1:5432/Workflow
-```
-
-> **No API key?** Set `USE_MOCK_LLM=true` in `.env`. The full workflow runs with deterministic keyword-based responses — see [Mock Mode](#9-mock--no-api-key-mode).
-
-### Step 4 — Create the database
-
-Create a database named `Workflow` in PostgreSQL (via PgAdmin or psql):
-
-```sql
-CREATE DATABASE "Workflow";
-```
-
-### Step 5 — Initialise tables
-
-```bash
-py -m app.db.init_db
-```
-
-Expected output:
-```
-INFO | PostgreSQL connection OK — PostgreSQL 17.x
-INFO | Tables created (or already exist).
-INFO | ✓ runs
-INFO | Database initialisation complete.
-```
-
-### Step 6 — Seed 50 demo records (optional)
-
-```bash
-py seed_data.py
-```
-
-Seeds 50 diverse workflow runs across all statuses — useful for demoing `GET /runs` and PgAdmin browsing.
-
 ---
 
 ## 8. Running the Project
 
-### Start the API server
+There are two ways to run this project. **Docker is recommended** — one command starts everything.
 
-```bash
-py -m uvicorn app.main:app --reload
+---
+
+### Option A — Docker (Recommended, Zero Setup)
+
+No Python install needed for the server. PostgreSQL runs in a container automatically.
+
+#### Step 1 — Copy the environment file
+
+```powershell
+# Windows
+copy .env.example .env
+
+# macOS / Linux
+cp .env.example .env
 ```
 
-The server starts at `http://localhost:8000`. On first startup it:
-1. Creates/verifies the `runs` table
-2. Initialises LangGraph's `AsyncPostgresSaver`
-3. Creates `checkpoints` and `checkpoint_writes` tables
-4. Compiles the graph with `interrupt_before=["human_approval"]`
+The default `.env` has `USE_MOCK_LLM=true` — the full workflow runs without any Nvidia API key.
+If you have a key, set `NVIDIA_API_KEY=nvapi-...` and `USE_MOCK_LLM=false`.
 
-### Interactive demo CLI (recommended for demos)
+#### Step 2 — Start everything with one command (Windows PowerShell)
 
-Open a second terminal:
+```powershell
+.\docker-start.ps1
+```
 
-```bash
+This script:
+1. Checks Docker Desktop is running
+2. Builds the images (first run ~5 min, cached ~15s after)
+3. Starts PostgreSQL, the FastAPI app, and a one-shot DB init container
+4. Waits until `http://localhost:8000/health` returns `healthy`
+5. Confirms the seed data (50 demo records) is loaded
+6. Prints all access URLs
+
+Expected output when complete:
+```
+==========================================
+  All services are up!
+==========================================
+  API Server   :  http://localhost:8000
+  Swagger UI   :  http://localhost:8000/docs
+  Health Check :  http://localhost:8000/health
+  PostgreSQL   :  localhost:5432 / DB: Workflow
+                  User: postgres  Pass: Abhiram@123
+  Run the interactive CLI demo:
+    py demo_cli.py
+  Run automated evaluation:
+    py evaluate.py
+  Tail app logs:
+    docker compose logs -f app
+  Stop everything:
+    .\docker-start.ps1 -Down
+```
+
+#### Step 2 (alternative) — Manual Docker commands
+
+```powershell
+# Start all containers in background
+docker compose up --build -d
+
+# Check container status
+docker compose ps
+
+# Tail app logs
+docker compose logs -f app
+
+# Tail db-init logs (to confirm seed completed)
+docker compose logs db-init
+
+# Stop everything
+docker compose down
+
+# Stop + delete database volume (full reset)
+docker compose down -v
+```
+
+#### Step 3 — Install local Python dependencies for the CLI
+
+The CLI (`demo_cli.py` and `evaluate.py`) run on your **local machine** and talk to the Docker API at `localhost:8000`. Install once:
+
+```powershell
+py -m pip install -r requirements.txt
+```
+
+#### Step 4 — Run the interactive demo CLI
+
+```powershell
 py demo_cli.py
 ```
 
-### Automated evaluation (covers all 5 rubric scenarios)
+The CLI connects to `localhost:8000` (the Docker container). You will see:
 
-```bash
+```
+╭────────────────────────────────────────────────────────────────╮
+│  Customer Support Triage Orchestrator                          │
+│  Interactive Demo CLI                                          │
+╰────────────────────────────────────────────────────────────────╯
+  API   : healthy    Database : ok    Mock LLM : YES
+
+  [1]  Start a new workflow run (normal)
+  [2]  Start a run WITH injected failure (test retry)
+  [3]  View pending approvals  ⬅ runs waiting for YOU
+  [4]  List all runs
+  [5]  Inspect / act on a specific run
+  [6]  Run automated evaluation (all 5 scenarios)
+  [H]  Health check
+  [Q]  Quit
+
+Choose (3):
+```
+
+#### CLI interaction walkthrough
+
+**Start a normal run (Option 1):**
+```
+Choose (3): 1
+
+Enter customer ticket text: I was charged twice for my Pro subscription...
+Customer email: demo@customer.com
+Customer ID: CUST-4421
+
+  Run ID : 550e8400-e29b-41d4-a716-446655440000
+  Status : paused
+
+  ┌ Step 1 — Triage ──────────────────────────────────┐
+  │  Category  : Billing                              │
+  │  Urgency   : High                                 │
+  │  Sentiment : frustrated                           │
+  └───────────────────────────────────────────────────┘
+
+  ┌ Step 2 — Billing API Data ────────────────────────┐
+  │  Invoice ID : INV-10156   Status : overdue         │
+  │  Amount Due : $99.98      Suspended : No           │
+  └───────────────────────────────────────────────────┘
+
+  ┌ Step 3 — Draft Reply (68 words) ──────────────────┐
+  │  Thank you for reaching out. We have reviewed...  │
+  └───────────────────────────────────────────────────┘
+
+  ⏸  Workflow paused — awaiting your approval.
+  [A] Approve → email sent   [R] Reject   [C] Cancel
+
+Your decision: A
+Reviewer note: Looks good, send it.
+
+  ✓ Approved — email dispatched to demo@customer.com
+  ✓ status: completed
+```
+
+**View pending approvals (Option 3):**
+```
+Choose (3): 3
+
+  3 run(s) awaiting approval:
+
+  1. 550e8400-...  demo@customer.com  Category: Billing  Urgency: High
+  2. 661f9511-...  user@example.com   Category: Tech     Urgency: Low
+  3. 772a0622-...  cto@startup.com    Category: Billing  Urgency: High
+
+Enter number to review (or 0 to skip): 1
+→ Shows full LLM output + asks Approve / Reject / Cancel
+```
+
+**Inject a failure and retry (Option 2):**
+```
+Choose (3): 2
+
+  ⚡ inject_failure=True — Step 2 will raise a recoverable error
+
+  Status : failed
+  ● billing_lookup — Injected failure at billing_lookup — simulating timeout
+
+  ✗ Run Failed
+  [Y] Retry from last checkpoint   [C] Cancel
+
+Retry? Y
+  → Resumes from billing_lookup (triage NOT re-run)
+  → status: paused → Approve → status: completed
+```
+
+**List all runs (Option 4):**
+```
+Choose (3): 4
+Filter by status (leave blank for all):
+
+  Runs (57 total)
+  ┌──────────────────────────────────────┬───────────┬─────────┬────────┐
+  │ Run ID                               │ Status    │ Category│ Urgency│
+  ├──────────────────────────────────────┼───────────┼─────────┼────────┤
+  │ db363e5b-e3d6-4544-8a1a-65984df91c1a │ completed │ Billing │ Low    │
+  │ 74502530-ce3c-4766-91b1-1e2f23b3b6ce │ paused    │ Billing │ High   │
+  │ ...                                  │ ...       │ ...     │ ...    │
+  └──────────────────────────────────────┴───────────┴─────────┴────────┘
+```
+
+#### Step 5 — Run automated evaluation
+
+```powershell
 py evaluate.py
 ```
 
-### API documentation
+Runs all 5 required scenarios automatically and prints pass/fail for every assertion:
 
-- Swagger UI: `http://localhost:8000/docs`
-- ReDoc: `http://localhost:8000/redoc`
-- Health check: `http://localhost:8000/health`
+```
+Scenario 1/5 — NORMAL RUN
+  ✓ run_id is UUID4
+  ✓ status after trigger: paused
+  ✓ email NOT sent before approval
+  ✓ status after approve: completed
+  ✓ email_sent: true
+  ✓ All 5 steps in step_log
+  ✓ Scenario 1 PASSED
+
+Scenario 2/5 — INJECT FAILURE + RETRY
+  ✓ status after failure: failed
+  ✓ error recorded in errors[]
+  ✓ After retry: status completed
+  ✓ Triage node ran exactly once (not replayed) — count: 1
+  ✓ Scenario 2 PASSED
+
+...
+
+  5/5 scenarios passed
+  Total evaluation time: 12.4s
+```
+
+---
+
+### Option B — Local Python (No Docker)
+
+Use this if you have PostgreSQL running locally and prefer no containers.
+
+#### Step 1 — Configure environment
+
+```powershell
+copy .env.example .env
+```
+
+Edit `.env`:
+```env
+# No API key needed — mock mode is on by default
+USE_MOCK_LLM=true
+
+# PostgreSQL — local connection (@ in password must be URL-encoded as %40)
+DATABASE_URL=postgresql+asyncpg://postgres:Abhiram%40123@127.0.0.1:5432/Workflow
+PSYCOPG_URL=postgresql+psycopg://postgres:Abhiram%40123@127.0.0.1:5432/Workflow
+CHECKPOINT_DB_URI=postgresql://postgres:Abhiram%40123@127.0.0.1:5432/Workflow
+```
+
+> **Password encoding:** If your PostgreSQL password contains `@`, you must encode it as `%40` in all three URLs. Use `127.0.0.1` not `localhost` on Windows.
+
+#### Step 2 — Install dependencies
+
+```powershell
+py -m pip install -r requirements.txt
+```
+
+#### Step 3 — Create database and initialise tables
+
+```sql
+-- In PgAdmin or psql:
+CREATE DATABASE "Workflow";
+```
+
+```powershell
+py -m app.db.init_db
+```
+
+Expected:
+```
+INFO | PostgreSQL connection OK — PostgreSQL 17.x
+INFO | ✓ runs
+INFO | Database initialisation complete.
+```
+
+#### Step 4 — Seed demo data (optional)
+
+```powershell
+py seed_data.py
+```
+
+Inserts 50 diverse workflow runs across all statuses (completed, paused, failed, cancelled, rejected).
+
+#### Step 5 — Start the API server
+
+```powershell
+py -m uvicorn app.main:app --reload
+```
+
+Wait for:
+```
+INFO | Application startup complete — ready to accept requests.
+INFO | Uvicorn running on http://127.0.0.1:8000
+```
+
+#### Step 6 — Run the CLI (in a second terminal)
+
+```powershell
+py demo_cli.py
+```
+
+#### Step 7 — Run automated evaluation
+
+```powershell
+py evaluate.py
+```
+
+---
+
+### Access Points (both options)
+
+| Service | URL |
+|---|---|
+| API server | `http://localhost:8000` |
+| Swagger UI (interactive docs) | `http://localhost:8000/docs` |
+| ReDoc | `http://localhost:8000/redoc` |
+| Health check | `http://localhost:8000/health` |
+| Config info | `http://localhost:8000/config` |
+| PostgreSQL | `localhost:5432` / DB: `Workflow` |
 
 ---
 
 ## 9. Mock / No-API-Key Mode
 
-Set `USE_MOCK_LLM=true` in `.env`. No Nvidia key required.
+`USE_MOCK_LLM=true` is the **default in both `.env.example` and `docker-compose.yml`**. No Nvidia key required.
 
 The mock path:
-- **Triage**: keyword matching — tickets containing "billing", "invoice", "charge" → `Billing/High`; "api", "error", "login" → `Tech/High`; etc.
+- **Triage**: keyword matching — tickets containing `"billing"`, `"invoice"`, `"charge"` → `Billing/High`; `"api"`, `"error"`, `"login"` → `Tech/High`; etc.
 - **Draft reply**: template-based, references the specialist data retrieved
 - **Thinking trace**: empty string (no LLM reasoning)
 - **All other steps**: identical to the live path — billing lookup, doc search, approval gate, idempotency guard, checkpoint persistence all work exactly the same
@@ -860,32 +1090,37 @@ Customer Support — Priority Team
 
 ---
 
-## 17. Docker
+## 18. Docker Reference
 
-### Start PostgreSQL only (recommended for local development)
+All Docker commands from one place.
 
-```bash
-docker-compose up -d postgres
-```
+```powershell
+# ---- First time --------------------------------------------------------
+.\docker-start.ps1                  # build + start + seed + health check
 
-Then run the app locally with `py -m uvicorn app.main:app --reload`.
+# ---- Day to day --------------------------------------------------------
+docker compose up -d                # start (no rebuild, uses cached image)
+docker compose up --build -d        # start + rebuild image
+docker compose ps                   # check container status
+docker compose logs -f app          # tail API server logs live
+docker compose logs -f db-init      # check if seed completed
+docker compose restart app          # restart just the API (e.g. after .env change)
 
-### Start everything (PostgreSQL + app)
+# ---- Stop ---------------------------------------------------------------
+docker compose down                 # stop containers, keep database volume
+docker compose down -v              # stop + delete database volume (full reset)
+.\docker-start.ps1 -Down            # same as docker compose down
 
-```bash
-docker-compose up --build
-```
-
-The `app` service uses the internal Docker network hostname `postgres` instead of `127.0.0.1`. Environment variables in `docker-compose.yml` override `.env` for container-to-container connectivity.
-
-### Verify
-
-```bash
+# ---- Verify health -------------------------------------------------------
 curl http://localhost:8000/health
-```
+# Expected: {"status":"healthy","mock_llm":true,"checks":{"database":"ok","graph":"ok"}}
 
-```json
-{"status": "healthy", "checks": {"database": "ok", "graph": "ok"}}
+# ---- PgAdmin connection --------------------------------------------------
+# Host     : localhost
+# Port     : 5432
+# Database : Workflow
+# Username : postgres
+# Password : Abhiram@123
 ```
 
 ---
