@@ -1,17 +1,41 @@
-version: "3.9"
+# =============================================================================
+# Workflow Orchestrator — Docker Compose
+#
+# Services:
+#   postgres   — PostgreSQL 17 database (checkpoints + run metadata)
+#   app        — FastAPI + LangGraph orchestrator (http://localhost:8000)
+#   db-init    — One-shot: creates tables + seeds 50 demo records, then exits
+#
+# Quick start (first time):
+#   .\docker-start.ps1               # Windows PowerShell — recommended
+#   docker compose up --build -d     # manual alternative
+#
+# After containers are running, demo CLI runs on your LOCAL machine:
+#   py demo_cli.py                   # interactive demo (points to localhost:8000)
+#   py evaluate.py                   # automated 5-scenario evaluation
+#
+# Useful commands:
+#   docker compose logs -f app       # tail API server logs
+#   docker compose logs -f db-init   # check if seed completed
+#   docker compose ps                # see container status
+#   docker compose down              # stop everything
+#   docker compose down -v           # stop + delete database volume (full reset)
+# =============================================================================
 
 services:
+
   # ---------------------------------------------------------------------------
-  # PostgreSQL — primary database (checkpoints + run metadata)
-  # Matches PgAdmin credentials provided
+  # PostgreSQL 17 — primary database
+  # Accessible on the host at localhost:5432 for PgAdmin or psql
+  # Credentials: postgres / Abhiram@123 / Database: Workflow
   # ---------------------------------------------------------------------------
   postgres:
-    image: postgres:16-alpine
+    image: postgres:17-alpine
     container_name: workflow_postgres
     restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: Abhiram@123
+      POSTGRES_PASSWORD: "Abhiram@123"
       POSTGRES_DB: Workflow
     ports:
       - "5432:5432"
@@ -20,13 +44,19 @@ services:
       - ./scripts/init_extensions.sql:/docker-entrypoint-initdb.d/01_init_extensions.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d Workflow"]
-      interval: 10s
+      interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 10s
 
   # ---------------------------------------------------------------------------
-  # Application — FastAPI + LangGraph orchestrator
-  # Comment this out if running the app locally (uvicorn app.main:app --reload)
+  # FastAPI + LangGraph Application
+  # http://localhost:8000        — API
+  # http://localhost:8000/docs   — Swagger UI
+  # http://localhost:8000/health — Health check
+  #
+  # DB URLs override the localhost values from .env with the Docker-internal
+  # 'postgres' hostname. The @ in the password is URL-encoded as %40.
   # ---------------------------------------------------------------------------
   app:
     build:
@@ -40,13 +70,56 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://postgres:Abhiram@123@postgres:5432/Workflow
-      PSYCOPG_URL: postgresql+psycopg://postgres:Abhiram@123@postgres:5432/Workflow
-      CHECKPOINT_DB_URI: postgresql://postgres:Abhiram@123@postgres:5432/Workflow
+      # Docker-internal hostnames — override .env which uses 127.0.0.1
+      DATABASE_URL: "postgresql+asyncpg://postgres:Abhiram%40123@postgres:5432/Workflow"
+      PSYCOPG_URL: "postgresql+psycopg://postgres:Abhiram%40123@postgres:5432/Workflow"
+      CHECKPOINT_DB_URI: "postgresql://postgres:Abhiram%40123@postgres:5432/Workflow"
+      APP_ENV: "development"
     ports:
       - "8000:8000"
     volumes:
-      - ./app:/app/app         # hot-reload in dev
+      # Live-reload source mounts — changes to app/ restart uvicorn automatically
+      - ./app:/app/app
+      - ./seed_data.py:/app/seed_data.py
+      - ./evaluate.py:/app/evaluate.py
+    command: >
+      uvicorn app.main:app
+      --host 0.0.0.0
+      --port 8000
+      --reload
+      --log-level info
+
+  # ---------------------------------------------------------------------------
+  # DB Init — runs once, then exits (restart: "no")
+  # 1. Creates ORM tables (runs, indexes)
+  # 2. Seeds 50 diverse demo records
+  #
+  # To skip seeding on subsequent starts, comment out the seed line in command.
+  # Tables already existing is safe — init_db is idempotent.
+  # ---------------------------------------------------------------------------
+  db-init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: workflow_db_init
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://postgres:Abhiram%40123@postgres:5432/Workflow"
+      PSYCOPG_URL: "postgresql+psycopg://postgres:Abhiram%40123@postgres:5432/Workflow"
+      CHECKPOINT_DB_URI: "postgresql://postgres:Abhiram%40123@postgres:5432/Workflow"
+    command: >
+      sh -c "
+        echo '>>> Initialising database tables...' &&
+        python -m app.db.init_db &&
+        echo '>>> Seeding 50 demo records...' &&
+        python seed_data.py &&
+        echo '>>> DB init complete. Container will now exit.'
+      "
 
 volumes:
   postgres_data:

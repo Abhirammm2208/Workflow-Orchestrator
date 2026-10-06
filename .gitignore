@@ -4,6 +4,7 @@
 
 # --- Secrets — NEVER commit these ---
 .env
+.env.docker
 *.pem
 *.key
 *.p12
